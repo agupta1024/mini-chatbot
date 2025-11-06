@@ -3,3 +3,4 @@ regex
 transformers
 torch
 wget
+datasets
