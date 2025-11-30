@@ -21,6 +21,9 @@ import os
 
 # ----------------------------------------------
 
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -277,7 +280,7 @@ import time
 
 # gradient accumulation steps - used to simulate larger batch sizes that don't fit
 total_batch_size = 524288 # total effective batch size 2 ** 19 ~ 0.5 M GPT-2 batch size
-B = 64 # micro batch size
+B = 16 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total batch size is multiple of B * T"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -290,8 +293,8 @@ if master_process:
 import tiktoken
 from data_loader import DataLoaderLite
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split = 'train') # batch size 4, sequence length 32. By default you want to max out the GPU with batch size
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split = 'val')
 torch.set_float32_matmul_precision('high')  # use high precision for matmuls - bFloat16
-
 
 # create the model 
 model = GPT(GPTConfig(vocab_size=50304))
@@ -320,6 +323,8 @@ max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715 # 375e6 warmup tokens
 max_steps = 19073 # we have 10e9  tokens with 2**19 tokens/step 
+warmup_steps = 225
+max_steps = 6000
 
 def get_lr(step):
     # 1. linear warmup for first warmup steps
@@ -340,6 +345,63 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=3e-4,
 for step in range(max_steps):
     # forward the model
     t0 = time.time()
+
+    # once in a while evaluate the validation loss
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x,y = val_loader.get_batch()
+                x,y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, loss = model(x,y)
+                loss = loss/ val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            torch.distributed.all_reduce(val_loss_accum, op=torch.distributed.ReduceOp.AVG)
+        if master_process:
+            print(f"Validation loss: {val_loss_accum.item():.4f}")
+
+    # once in a while generate samples from the model(except step0 which is noise)
+    # not working with torch.compile enabled
+    # if step>0 and step % 100 == 0:
+    #     model.eval()
+    #     num_return_sequences = 4
+    #     max_length = 32
+    #     tokens = enc.encode("Hello, I'm a language model,")
+    #     tokens = torch.tensor(tokens, dtype=torch.long)
+    #     tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+    #     xgen = tokens.to(device)
+    #     sample_rng = torch.Generator(device=device)
+    #     sample_rng.manual_seed(42 + ddp_rank)
+    #     while xgen.size(1) < max_length:
+    #         # forward the model to get the logits
+    #         with torch.no_grad():
+    #             logits, loss = model(xgen) # (B, T, vocab_size)
+    #             # take the logits at the last position
+    #             logits = logits[:, -1, :] # (B, vocab_size)
+    #             # get the probabilities
+    #             probs = F.softmax(logits, dim=-1)
+    #             # top-k sampling of 50 (huggingface pipeline default)
+    #             # top_probs become (5, 50), topk_indices is (5, 50)
+    #             topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+    #             # select a token from top-k probs
+    #             ix = torch.multinomial(topk_probs, 1, generator=sample_rng) #(B, 1)
+    #             # gather the corresponding indices 
+    #             xcol = torch.gather(topk_indices, -1, ix) #(B, 1)
+    #             # append to the sequence 
+    #             x = torch.cat((x, xcol), dim=1)
+    #     # print generated text
+    #     for i in range(num_return_sequences):
+    #         tokens = xgen[i, :max_length].tolist()
+    #         decoded = enc.decode(tokens)
+    #         print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+    # training loop
+    model.train()
     optimizer.zero_grad() ##### Always zero the gradients before running the backward pass
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
@@ -354,11 +416,17 @@ for step in range(max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         # backward pass
+        #if master_process:
+        #    print(f"Before back pass step {micro_step}")
         loss.backward()
+        #if master_process:
+        #    print(f"After backward pass: step {micro_step}, loss {loss_accum.item():.4f}")
     if ddp:
         torch.distributed.all_reduce(loss_accum, op=torch.distributed.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # global gradient clipping to prevent shock to the model
     lr = get_lr(step)
+    if lr == 0.0:
+        lr = 6e-4
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step() # to update the parameters and decrease the loss
@@ -368,7 +436,9 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if step % 10 == 0 and master_process:
-        print(f"step {step}, loss {loss_accum.item():.4f} | lr: {lr:.4f} | norm: {norm:.4f} | time {dt*1000:.2f}ms tokens/sec {tokens_per_sec:.2f}")
+        print(f"step {step}, loss {loss_accum.item():.4f} | lr: {lr:.6f} | norm: {norm:.4f} | time {dt*1000:.2f}ms tokens/sec {tokens_per_sec:.2f}")
+
+torch.save(model, os.path.join('./', 'model.pt'))
 
 if ddp:
     destroy_process_group()
